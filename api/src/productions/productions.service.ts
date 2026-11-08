@@ -3,9 +3,11 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  Optional,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { randomUUID } from 'crypto';
 import { DataSource, Repository } from 'typeorm';
 import {
   Production,
@@ -30,6 +32,12 @@ import { CreateProductionDto } from './dto/create-production.dto';
 import { UpdateProductionDto } from './dto/update-production.dto';
 import { SubstituteEquipmentDto } from './dto/substitute-equipment.dto';
 import { QueryProductionsDto } from './dto/query-productions.dto';
+import { EquipmentReservationPolicyService } from './domain/services/equipment-reservation-policy.service';
+import { ProductionPeriod } from './domain/value-objects/production-period.vo';
+import { ProductionMapper } from './domain/production.mapper';
+import { RedisService } from '../redis/redis.service';
+import { DomainEventEnvelope } from '../redis/redis.constants';
+import { EventAuditLog } from '../events/entities/event-audit-log.entity';
 
 @Injectable()
 export class ProductionsService {
@@ -50,6 +58,16 @@ export class ProductionsService {
     private readonly userRepo: Repository<User>,
 
     private readonly dataSource: DataSource,
+
+    @Optional()
+    private readonly reservationPolicy?: EquipmentReservationPolicyService,
+
+    @Optional()
+    private readonly redisService?: RedisService,
+
+    @Optional()
+    @InjectRepository(EventAuditLog)
+    private readonly eventAuditRepo?: Repository<EventAuditLog>,
   ) {}
 
   /**
@@ -57,19 +75,33 @@ export class ProductionsService {
    * e associa os equipamentos solicitados.
    */
   async create(dto: CreateProductionDto): Promise<Production> {
+    const period = ProductionPeriod.create(dto.scheduledAt, dto.scheduledEndAt);
+
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
     try {
+      // 0. Validar política de não-sobreposição de reservas com lock pessimista
+      if (
+        this.reservationPolicy &&
+        dto.equipmentIds &&
+        dto.equipmentIds.length > 0
+      ) {
+        await this.reservationPolicy.validateNoOverlappingReservations(
+          dto.equipmentIds,
+          period,
+          undefined,
+          queryRunner.manager,
+        );
+      }
+
       // 1. Criar entidade Production
       const production = this.productionRepo.create({
         title: dto.title,
         description: dto.description || null,
-        scheduledAt: new Date(dto.scheduledAt),
-        scheduledEndAt: dto.scheduledEndAt
-          ? new Date(dto.scheduledEndAt)
-          : null,
+        scheduledAt: period.startDate,
+        scheduledEndAt: dto.scheduledEndAt ? period.endDate : null,
         isAllDay: dto.isAllDay ?? false,
         timezone: dto.timezone || 'America/Sao_Paulo',
         status: ProductionStatus.SCHEDULED,
@@ -153,8 +185,109 @@ export class ProductionsService {
         }
       }
 
+      // 4. Registrar trilha de auditoria transacional
+      const eventEnvelope: DomainEventEnvelope = {
+        eventId: randomUUID(),
+        eventType: 'ProductionConfirmedEvent',
+        aggregateId: savedProduction.id,
+        occurredAt: new Date().toISOString(),
+        version: 1,
+        payload: {
+          productionId: savedProduction.id,
+          title: savedProduction.title,
+          status: savedProduction.status,
+          scheduledAt: savedProduction.scheduledAt,
+          scheduledEndAt: savedProduction.scheduledEndAt,
+          equipmentIds: dto.equipmentIds ?? [],
+        },
+      };
+
+      if (this.eventAuditRepo) {
+        const auditLog = this.eventAuditRepo.create({
+          eventType: eventEnvelope.eventType,
+          aggregateId: eventEnvelope.aggregateId,
+          payload: eventEnvelope.payload,
+        });
+        await queryRunner.manager.save(EventAuditLog, auditLog);
+      }
+
       await queryRunner.commitTransaction();
+
+      // 5. Publicação no Redis Pub/Sub estritamente pós-commit
+      if (this.redisService) {
+        await this.redisService.publishDomainEvent(eventEnvelope);
+      }
+
       return this.findOne(savedProduction.id);
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  /**
+   * Confirma explicitamente uma produção, validando invariantes do Agregado DDD,
+   * checando não-sobreposição de equipamentos com lock pessimista e disparando evento pós-commit.
+   */
+  async confirmProduction(id: string): Promise<Production> {
+    const production = await this.findOne(id);
+    const aggregate = ProductionMapper.toDomain(production);
+
+    const activeEquipmentIds = aggregate.equipments
+      .filter((item) => item.isActive)
+      .map((item) => item.equipmentId);
+
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      if (this.reservationPolicy && activeEquipmentIds.length > 0) {
+        await this.reservationPolicy.validateNoOverlappingReservations(
+          activeEquipmentIds,
+          aggregate.period,
+          production.id,
+          queryRunner.manager,
+        );
+      }
+
+      production.status = ProductionStatus.SCHEDULED;
+      await queryRunner.manager.save(Production, production);
+
+      const eventEnvelope: DomainEventEnvelope = {
+        eventId: randomUUID(),
+        eventType: 'ProductionConfirmedEvent',
+        aggregateId: production.id,
+        occurredAt: new Date().toISOString(),
+        version: 1,
+        payload: {
+          productionId: production.id,
+          title: production.title,
+          status: production.status,
+          scheduledAt: production.scheduledAt,
+          scheduledEndAt: production.scheduledEndAt,
+          equipmentIds: activeEquipmentIds,
+        },
+      };
+
+      if (this.eventAuditRepo) {
+        const auditLog = this.eventAuditRepo.create({
+          eventType: eventEnvelope.eventType,
+          aggregateId: eventEnvelope.aggregateId,
+          payload: eventEnvelope.payload,
+        });
+        await queryRunner.manager.save(EventAuditLog, auditLog);
+      }
+
+      await queryRunner.commitTransaction();
+
+      if (this.redisService) {
+        await this.redisService.publishDomainEvent(eventEnvelope);
+      }
+
+      return this.findOne(production.id);
     } catch (error) {
       await queryRunner.rollbackTransaction();
       throw error;

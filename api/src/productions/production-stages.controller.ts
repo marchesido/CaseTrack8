@@ -16,6 +16,7 @@ import {
 } from '@nestjs/swagger';
 import { ProductionStagesService } from './production-stages.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { InvalidateCache } from '../common/decorators/invalidate-cache.decorator';
 
 @ApiTags('Production Stages')
 @ApiBearerAuth()
@@ -25,6 +26,7 @@ export class ProductionStagesController {
   constructor(private readonly stagesService: ProductionStagesService) {}
 
   @Patch(':stageId/start')
+  @InvalidateCache(['productions', 'dashboard'])
   @ApiOperation({
     summary: 'Iniciar o andamento de uma etapa (PENDING -> IN_PROGRESS)',
   })
@@ -40,6 +42,7 @@ export class ProductionStagesController {
   }
 
   @Post(':stageId/complete')
+  @InvalidateCache(['productions', 'dashboard'])
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary:

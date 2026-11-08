@@ -27,6 +27,8 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
 import { UserRole } from '../users/entities/user.entity';
+import { Cacheable } from '../common/decorators/cacheable.decorator';
+import { InvalidateCache } from '../common/decorators/invalidate-cache.decorator';
 
 @ApiTags('Productions')
 @ApiBearerAuth()
@@ -38,6 +40,7 @@ export class ProductionsController {
   @Post()
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN)
+  @InvalidateCache(['productions', 'dashboard'])
   @ApiOperation({
     summary: 'Criar nova produção com etapas e equipamentos (ADMIN)',
   })
@@ -63,6 +66,7 @@ export class ProductionsController {
   }
 
   @Get()
+  @Cacheable({ namespace: 'productions', ttl: 60 })
   @ApiOperation({
     summary: 'Listar produções com filtros (data, status, busca)',
   })
@@ -85,6 +89,7 @@ export class ProductionsController {
   @Patch(':id')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN)
+  @InvalidateCache(['productions', 'dashboard'])
   @ApiOperation({ summary: 'Atualizar dados cadastrais da produção (ADMIN)' })
   @ApiResponse({ status: 200, description: 'Produção atualizada com sucesso' })
   @ApiResponse({ status: 404, description: 'Produção não encontrada' })
@@ -92,9 +97,26 @@ export class ProductionsController {
     return this.productionsService.update(id, updateDto);
   }
 
+  @Patch(':id/confirm')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @InvalidateCache(['productions', 'dashboard'])
+  @ApiOperation({
+    summary:
+      'Confirmar produção validando reservas sem sobreposição e publicando evento pós-commit (ADMIN)',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Produção confirmada e evento publicado no Redis Pub/Sub',
+  })
+  confirm(@Param('id') id: string) {
+    return this.productionsService.confirmProduction(id);
+  }
+
   @Delete(':id')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN)
+  @InvalidateCache(['productions', 'dashboard'])
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Cancelamento lógico da produção (ADMIN)' })
   @ApiResponse({ status: 200, description: 'Produção cancelada com sucesso' })
@@ -106,6 +128,7 @@ export class ProductionsController {
   @Patch(':id/equipments/:peId/substitute')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN)
+  @InvalidateCache(['productions', 'dashboard'])
   @ApiOperation({
     summary:
       'Substituir equipamento avariado na produção mantendo histórico e liberando o fluxo (ADMIN)',

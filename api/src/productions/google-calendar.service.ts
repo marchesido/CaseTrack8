@@ -8,6 +8,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { google } from 'googleapis';
+import CircuitBreaker from 'opossum';
 import { GoogleToken } from './entities/google-token.entity';
 import { Production, GoogleSourceStatus } from './entities/production.entity';
 import { encryptToken, decryptToken } from './utils/crypto.util';
@@ -23,6 +24,8 @@ export interface GoogleConnectionStatus {
 
 export interface GoogleSyncResponse {
   success: boolean;
+  calendarSynced?: boolean;
+  warning?: string;
   googleEventId: string;
   googleCalendarId: string;
   htmlLink?: string | null;
@@ -33,6 +36,10 @@ export interface GoogleSyncResponse {
 export class GoogleCalendarService {
   private readonly logger = new Logger(GoogleCalendarService.name);
   private oauth2ClientInstance: any = null;
+  private readonly calendarBreaker: CircuitBreaker<
+    [() => Promise<any>],
+    any
+  >;
 
   constructor(
     @InjectRepository(GoogleToken)
@@ -40,7 +47,35 @@ export class GoogleCalendarService {
 
     @InjectRepository(Production)
     private readonly productionRepo: Repository<Production>,
-  ) {}
+  ) {
+    this.calendarBreaker = new CircuitBreaker(
+      async (operation: () => Promise<any>) => operation(),
+      {
+        timeout: 3000,
+        errorThresholdPercentage: 50,
+        resetTimeout: 30000,
+        volumeThreshold: 2,
+      },
+    );
+
+    this.calendarBreaker.on('open', () => {
+      this.logger.warn(
+        '[CIRCUIT_BREAKER_OPEN] Circuito aberto para Google Calendar API (limiar de falhas excedido).',
+      );
+    });
+
+    this.calendarBreaker.on('halfOpen', () => {
+      this.logger.log(
+        '[CIRCUIT_BREAKER_HALF_OPEN] Testando recuperação da Google Calendar API...',
+      );
+    });
+
+    this.calendarBreaker.on('close', () => {
+      this.logger.log(
+        '[CIRCUIT_BREAKER_CLOSED] Google Calendar API restabelecida.',
+      );
+    });
+  }
 
   /**
    * Obtém ou inicializa a instância do cliente OAuth2 do Google.
@@ -390,36 +425,55 @@ export class GoogleCalendarService {
     let resultEvent: any;
 
     try {
-      if (production.googleEventId) {
-        // Tenta atualizar o evento existente
-        try {
-          const updateRes = await calendar.events.patch({
-            calendarId,
-            eventId: production.googleEventId,
-            requestBody: eventPayload,
-          });
-          resultEvent = updateRes.data;
-        } catch (updateErr: any) {
-          // Se o evento foi excluído remotamente no Google (404), recria
-          if (updateErr?.status === 404 || updateErr?.code === 404) {
-            const insertRes = await calendar.events.insert({
+      resultEvent = await this.calendarBreaker.fire(async () => {
+        if (production.googleEventId) {
+          // Tenta atualizar o evento existente
+          try {
+            const updateRes = await calendar.events.patch({
               calendarId,
+              eventId: production.googleEventId,
               requestBody: eventPayload,
             });
-            resultEvent = insertRes.data;
-          } else {
+            return updateRes.data;
+          } catch (updateErr: any) {
+            // Se o evento foi excluído remotamente no Google (404), recria
+            if (updateErr?.status === 404 || updateErr?.code === 404) {
+              const insertRes = await calendar.events.insert({
+                calendarId,
+                requestBody: eventPayload,
+              });
+              return insertRes.data;
+            }
             throw updateErr;
           }
+        } else {
+          // Novo evento
+          const insertRes = await calendar.events.insert({
+            calendarId,
+            requestBody: eventPayload,
+          });
+          return insertRes.data;
         }
-      } else {
-        // Novo evento
-        const insertRes = await calendar.events.insert({
-          calendarId,
-          requestBody: eventPayload,
-        });
-        resultEvent = insertRes.data;
-      }
+      });
     } catch (apiErr: any) {
+      if (
+        this.calendarBreaker.opened ||
+        apiErr?.code === 'EOPENBREAKER' ||
+        apiErr?.code === 'ETIMEDOUT'
+      ) {
+        this.logger.warn(
+          `[CIRCUIT_BREAKER_OPEN] Degradação graciosa ativada para produção ${production.id}: ${apiErr.message}`,
+        );
+        return {
+          success: false,
+          calendarSynced: false,
+          warning: 'Agenda externa temporariamente indisponível',
+          googleEventId: production.googleEventId || '',
+          googleCalendarId: calendarId,
+          htmlLink: null,
+          syncedAt: production.lastSyncedAt || new Date(),
+        };
+      }
       this.logger.error(
         `Falha ao sincronizar com Google Calendar API: ${apiErr.message}`,
       );

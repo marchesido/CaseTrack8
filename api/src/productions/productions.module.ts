@@ -19,6 +19,8 @@ import { EquipmentMovementsController } from './equipment-movements.controller';
 import { GoogleCalendarService } from './google-calendar.service';
 import { GoogleCalendarController } from './google-calendar.controller';
 import { ProductionAccessGuard } from './guards/production-access.guard';
+import { EquipmentReservationPolicyService } from './domain/services/equipment-reservation-policy.service';
+import { EventAuditLog } from '../events/entities/event-audit-log.entity';
 
 @Module({
   imports: [
@@ -31,6 +33,7 @@ import { ProductionAccessGuard } from './guards/production-access.guard';
       Equipment,
       User,
       Damage,
+      EventAuditLog,
     ]),
   ],
   controllers: [
@@ -46,6 +49,7 @@ import { ProductionAccessGuard } from './guards/production-access.guard';
     EquipmentMovementsService,
     GoogleCalendarService,
     ProductionAccessGuard,
+    EquipmentReservationPolicyService,
   ],
   exports: [
     ProductionsService,
@@ -53,6 +57,7 @@ import { ProductionAccessGuard } from './guards/production-access.guard';
     ProductionCompletionService,
     EquipmentMovementsService,
     GoogleCalendarService,
+    EquipmentReservationPolicyService,
     TypeOrmModule,
   ],
 })
