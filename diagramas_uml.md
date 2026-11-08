@@ -1,0 +1,417 @@
+# Diagramas UML - CaseTrack
+
+Abaixo estão os diagramas de arquitetura do sistema CaseTrack, abrangendo Casos de Uso, Atividades, Sequência e o Modelo de Dados (DER).
+
+## 1. Diagramas de Casos de Uso
+
+### 1.1 Gestão de Equipamentos e Usuários (Foco Admin)
+```mermaid
+usecaseDiagram
+    actor Admin as "Admin / Produtora"
+    
+    package "CaseTrack - Gestão Base" {
+        usecase UC1 as "Gerenciar Usuários (CRUD)"
+        usecase UC2 as "Gerenciar Equipamentos (CRUD)"
+        usecase UC3 as "Visualizar Relatórios"
+    }
+    
+    Admin --> UC1
+    Admin --> UC2
+    Admin --> UC3
+```
+
+### 1.2 Reserva, Check-in/out e Avarias (Foco Operacional)
+```mermaid
+usecaseDiagram
+    actor Free as "Freelancer"
+    actor Admin as "Admin / Produtora"
+    
+    package "CaseTrack - Operação" {
+        usecase UC4 as "Solicitar Reserva"
+        usecase UC5 as "Aprovar/Rejeitar Reserva"
+        usecase UC6 as "Realizar Check-out"
+        usecase UC7 as "Realizar Check-in"
+        usecase UC8 as "Registrar Avaria (Upload)"
+    }
+    
+    Free --> UC4
+    Free --> UC6
+    Free --> UC7
+    Free --> UC8
+    
+    Admin --> UC5
+    Admin --> UC6
+    Admin --> UC7
+```
+
+### 1.3 Ciclo de Produções Audiovisuais e Movimentações em Campo
+```mermaid
+usecaseDiagram
+    actor Produtor as "Produtor / Gestor de Set"
+    actor Operador as "Operador / Freelancer"
+    
+    package "CaseTrack - Produções e Set" {
+        usecase UC9 as "Criar e Gerenciar Produção (4 Etapas)"
+        usecase UC10 as "Alocar Equipamentos ao Projeto"
+        usecase UC11 as "Realizar Check-out de Equipamento"
+        usecase UC12 as "Realizar Check-in com Inspeção e Avaria"
+        usecase UC13 as "Substituir Equipamento em Campo"
+        usecase UC14 as "Concluir Etapa com Validação de Devolução"
+    }
+    
+    Produtor --> UC9
+    Produtor --> UC10
+    Produtor --> UC13
+    Produtor --> UC14
+    Operador --> UC11
+    Operador --> UC12
+```
+
+---
+
+## 2. Diagramas de Atividades
+
+### 2.1 Fluxo de Check-out com Registro de Avaria
+```mermaid
+activityDiagram
+    start
+    :Usuário seleciona Equipamento;
+    :Sistema exibe detalhes da Reserva;
+    if (Equipamento possui avaria prévia?) then (Sim)
+        :Usuário inspeciona avaria;
+    else (Não)
+    endif
+    if (Nova avaria identificada?) then (Sim)
+        :Usuário tira foto da avaria;
+        :Upload da imagem (Multer);
+        :Sistema valida (Tamanho, Extensão);
+        if (Validação OK?) then (Sim)
+            :Salva caminho da imagem BD;
+        else (Não)
+            :Exibe erro de Validação;
+            stop
+        endif
+    else (Não)
+    endif
+    :Confirma Check-out;
+    :Sistema atualiza Status do Equipamento para "Em Uso";
+    stop
+```
+
+### 2.2 Fluxo de Autenticação e Controle de Acesso
+```mermaid
+activityDiagram
+    start
+    :Usuário insere Credenciais (Email/Senha);
+    :Sistema valida credenciais;
+    if (Credenciais Corretas?) then (Sim)
+        :Sistema verifica Perfil (Role);
+        if (Admin?) then (Sim)
+            :Redireciona para Dashboard Produtora;
+        else (Freelancer)
+            :Redireciona para Home Freelancer;
+        endif
+    else (Não)
+        :Exibe mensagem de "Acesso Negado";
+    endif
+    stop
+```
+
+### 2.3 Fluxo de Conclusão da Captação e Auto-conclusão da Produção
+```mermaid
+activityDiagram
+    start
+    :Produtor solicita Conclusão da Etapa "Captação";
+    :Sistema busca equipamentos com status "CHECKED_OUT";
+    if (Existem equipamentos em posse da equipe?) then (Sim)
+        :Sistema bloqueia avanço da etapa;
+        :Exibe erro 400 "Devolva todos os itens para concluir a Captação";
+        stop
+    else (Não)
+        :Sistema marca Etapa como "COMPLETED";
+        :Avança status da Produção para próxima etapa;
+        if (Última etapa concluída E 100% itens devolvidos?) then (Sim)
+            :Atualiza status da Produção para "COMPLETED";
+        else (Não)
+        endif
+    endif
+    stop
+```
+
+---
+
+## 3. Diagramas de Sequência
+
+### 3.1 Fluxo de Upload de Imagem (Avaria e Acervo)
+```mermaid
+sequenceDiagram
+    participant App as Aplicativo Mobile
+    participant API as Backend (NestJS)
+    participant Auth as JwtAuthGuard & RolesGuard
+    participant FS as File System (Multer)
+    participant DB as Banco de Dados
+    
+    App->>API: POST /upload ou /damages (Multipart/FormData)
+    API->>Auth: Valida Token JWT e Perfil (Admin / Freelancer)
+    alt Não Autenticado ou Perfil Inválido
+        Auth-->>App: 401 Unauthorized / 403 Forbidden
+    else Autorizado
+        API->>FS: Intercepta Arquivo via Multer
+        FS-->>API: Metadados (extname(file.originalname), mimetype, size)
+        API->>API: Valida Extensão (.jpg, .jpeg, .png, .webp) e Tamanho (<= 5MB)
+        alt Arquivo Inválido
+            API-->>App: 400 Bad Request (Extensão ou tamanho inválido)
+        else Arquivo Válido
+            FS->>FS: Salva com Hash UUID v4 anti-colisão
+            API->>DB: INSERT Avaria ou Atualiza Equipamento
+            DB-->>API: Confirmação de Persistência
+            API-->>App: 201 Created (Upload realizado com sucesso)
+        end
+    end
+```
+
+### 3.2 Fluxo de Solicitação e Aprovação de Reserva
+```mermaid
+sequenceDiagram
+    participant Free as Freelancer (App)
+    participant API as Backend (API)
+    participant DB as Banco de Dados
+    participant Admin as Admin (Web/App)
+    
+    Free->>API: POST /reservas (ID Equipamento, Datas)
+    API->>DB: Verifica Disponibilidade
+    alt Não Disponível
+        DB-->>API: Conflito de Datas
+        API-->>Free: 409 Conflict (Equipamento Indisponível)
+    else Disponível
+        API->>DB: INSERT Reserva (Status: Pendente)
+        DB-->>API: Reserva Criada
+        API-->>Free: 201 Created (Reserva Solicitada)
+    end
+    
+    Note over API,Admin: Algum tempo depois...
+    Admin->>API: PUT /reservas/{id}/status (Aprovado)
+    API->>DB: UPDATE Reserva (Status: Aprovado)
+    DB-->>API: Atualizado
+    API-->>Admin: 200 OK
+```
+
+### 3.3 Fluxo de Substituição Atômica de Equipamento em Campo
+```mermaid
+sequenceDiagram
+    participant App as App Mobile (Produtor)
+    participant API as Backend (NestJS)
+    participant DB as Banco MySQL (TypeORM Tx)
+    
+    App->>API: POST /productions/{id}/equipments/{peId}/substitute
+    Note right of App: Payload: substituteEquipmentId, reason
+    API->>API: Valida Permissão (RolesGuard)
+    API->>DB: Inicia Transação Atômica (QueryRunner)
+    API->>DB: Busca ProductionEquipment atual e valida status
+    API->>DB: UPDATE ProductionEquipment (status = REPLACED, notes = reason)
+    API->>DB: INSERT ProductionEquipment (equipamento substituto, status = ALLOCATED)
+    API->>DB: Commit Transação
+    DB-->>API: Transação Confirmada
+    API-->>App: 200 OK (Item substituído com histórico preservado)
+```
+
+### 3.4 Fluxo de Sincronização com Google Calendar
+```mermaid
+sequenceDiagram
+    participant App as App Mobile
+    participant API as Backend (NestJS)
+    participant DB as Banco MySQL
+    participant GAuth as Google OAuth2
+    participant GCal as Google Calendar API v3
+    
+    App->>API: POST /productions/{id}/sync-google
+    API->>DB: Busca GoogleToken (singleton)
+    alt Access Token Expirado
+        API->>API: Descriptografa Refresh Token (AES-256-GCM)
+        API->>GAuth: POST /token (refresh_token)
+        alt Token Revogado / Inválido
+            GAuth-->>API: 400 invalid_grant
+            API-->>App: 424 Failed Dependency (GOOGLE_RECONNECT_REQUIRED)
+            Note over App: App exibe diálogo oferecendo reconexão sem logout
+        else Token Renovado com Sucesso
+            GAuth-->>API: Novos tokens (access_token, expires_in)
+            API->>DB: UPDATE GoogleToken (novo accessToken, expiresAt)
+        end
+    end
+    
+    API->>DB: Busca Produção com Etapas e Equipamentos
+    API->>GCal: POST/PATCH /calendars/primary/events (Payload com diárias e itens)
+    GCal-->>API: 200 OK (eventId, htmlLink)
+    API->>DB: UPDATE Production (googleEventId, lastSyncedAt, googleSourceStatus = ACTIVE)
+    API-->>App: 200 OK (Sincronizado com Sucesso)
+```
+
+### 3.5 Fluxo de Emissão de Termo em PDF e Assinatura Digital
+```mermaid
+sequenceDiagram
+    participant App as App Mobile (Produtor/Gestor)
+    participant API as Backend (NestJS)
+    participant PDF as PDFKit Generator
+    participant FS as File System (/uploads/contracts)
+    participant DB as Banco MySQL (TypeORM)
+    
+    App->>API: POST /contracts/production/:productionId
+    API->>DB: Busca Produção com Etapas e Equipamentos
+    alt Termo já existe para Produção
+        API-->>App: Retorna Contrato Existente
+    else Gerar Novo Termo
+        API->>PDF: Renderiza Termo de Responsabilidade (Layout Audiovisual)
+        Note over PDF: Cabeçalho, Metadados, Tabela de Itens (Serial), Cláusulas Legais
+        PDF->>FS: Salva termo_{uuid}.pdf em uploads/contracts/
+        API->>DB: INSERT Contrato (status = ISSUED, documento_url = /uploads/contracts/...)
+        DB-->>API: Contrato Salvo
+        API-->>App: 201 Created (Contrato Gerado)
+    end
+
+    App->>API: GET /contracts/:id/download
+    API->>FS: Stream application/pdf
+    FS-->>App: Exibe/Download do PDF no Dispositivo
+
+    App->>API: POST /contracts/:id/sign { signer_name, signer_document }
+    API->>DB: UPDATE Contrato (status = SIGNED, signer_name, signer_document, signed_at = NOW)
+    DB-->>API: Contrato Assinado
+    API-->>App: 200 OK (Termo Assinado com Sucesso)
+```
+
+---
+
+## 4. Diagrama Entidade-Relacionamento (DER)
+
+```mermaid
+erDiagram
+    USUARIO {
+        uuid id PK
+        string nome
+        string email
+        string senha_hash
+        string perfil "ADMIN ou FREELANCER"
+        datetime criado_em
+    }
+    
+    EQUIPAMENTO {
+        uuid id PK
+        string nome
+        string descricao
+        string serialNumber
+        string status "DISPONIVEL, EM_USO, MANUTENCAO"
+        string imageUrl
+        datetime createdAt
+    }
+    
+    RESERVA {
+        int id PK
+        uuid usuario_id FK
+        uuid equipamento_id FK
+        date data_inicio
+        date data_fim
+        string status "PENDENTE, APROVADA, REJEITADA"
+    }
+    
+    CHECK_IN_OUT {
+        int id PK
+        int reserva_id FK
+        datetime data_hora
+        string tipo "CHECKIN ou CHECKOUT"
+        uuid registrado_por_id FK
+    }
+    
+    AVARIA {
+        int id PK
+        uuid equipamento_id FK
+        uuid reportado_por_id FK
+        string descricao
+        string imagem_url
+        datetime data_registro
+    }
+
+    CONTRATO {
+        int id PK
+        uuid producao_id FK
+        int reserva_id FK
+        string documento_url
+        string status "DRAFT, ISSUED, SIGNED, CANCELLED"
+        string signer_name
+        string signer_document
+        datetime signed_at
+        string terms_summary
+        datetime emitido_em
+    }
+
+    PRODUCAO {
+        uuid id PK
+        string titulo
+        string descricao
+        string status "SCHEDULED, IN_PROGRESS, COMPLETED, CANCELLED"
+        datetime scheduledAt
+        datetime scheduledEndAt
+        boolean isAllDay
+        string timezone
+        string googleCalendarId
+        string googleEventId
+        string googleSourceStatus "ACTIVE, CANCELLED, DELETED"
+        datetime createdAt
+    }
+
+    ETAPA_PRODUCAO {
+        uuid id PK
+        uuid producao_id FK
+        string tipo "CAPTACAO, EDICAO, BACKUP, UPLOAD"
+        string status "PENDING, IN_PROGRESS, COMPLETED"
+        int ordem
+        datetime completedAt
+        uuid responsible_user_id FK
+        datetime createdAt
+    }
+
+    EQUIPAMENTO_PRODUCAO {
+        uuid id PK
+        uuid producao_id FK
+        uuid equipamento_id FK
+        string status "ALLOCATED, CHECKED_OUT, CHECKED_IN, REPLACED, DAMAGED"
+        datetime alocado_em
+        datetime devolvido_em
+        string notas
+    }
+
+    MOVIMENTACAO_EQUIPAMENTO {
+        uuid id PK
+        uuid producao_id FK
+        uuid producao_equipamento_id FK
+        string tipo "CHECK_OUT ou CHECK_IN"
+        string status "SUCCESS ou INSPECTION_FAILED"
+        uuid executado_por_id FK
+        datetime timestamp
+        string notas
+    }
+
+    GOOGLE_TOKEN {
+        int id PK
+        uuid usuario_id FK
+        string access_token_enc
+        string refresh_token_enc
+        string iv
+        string auth_tag
+        datetime expira_em
+    }
+
+    USUARIO ||--o{ RESERVA : solicita
+    USUARIO ||--o{ CHECK_IN_OUT : registra
+    USUARIO ||--o{ AVARIA : reporta
+    USUARIO ||--o{ PRODUCAO : gerencia
+    USUARIO ||--o{ GOOGLE_TOKEN : autentica
+    USUARIO ||--o{ MOVIMENTACAO_EQUIPAMENTO : realiza
+    EQUIPAMENTO ||--o{ RESERVA : associado_a
+    EQUIPAMENTO ||--o{ AVARIA : possui
+    EQUIPAMENTO ||--o{ EQUIPAMENTO_PRODUCAO : alocado_em
+    RESERVA ||--|{ CHECK_IN_OUT : tem
+    RESERVA ||--o| CONTRATO : gera
+    PRODUCAO ||--|{ ETAPA_PRODUCAO : composta_por
+    PRODUCAO ||--o{ EQUIPAMENTO_PRODUCAO : contem
+    PRODUCAO ||--o{ CONTRATO : gera
+    EQUIPAMENTO_PRODUCAO ||--o{ MOVIMENTACAO_EQUIPAMENTO : historico
+```
