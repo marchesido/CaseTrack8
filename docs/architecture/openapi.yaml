@@ -1,0 +1,743 @@
+openapi: 3.0.3
+info:
+  title: CaseTrack API - Gestão Audiovisual e Produções
+  description: >-
+    API REST para gestão de equipamentos audiovisuais, produções em 4 etapas (Captação, Edição,
+    Backup, Upload), controle de check-in/check-out com inspeção de avarias, emissão de termos
+    em PDF, cache com Redis e mensageria Pub/Sub.
+  version: 1.0.0
+  contact:
+    name: Douglas Alexandre Marchesi
+    url: https://github.com/marchesido/CaseTrack8
+servers:
+  - url: http://localhost/api/v1
+    description: Proxy Reverso Nginx (Porta 80)
+  - url: http://localhost:3000/api/v1
+    description: Desenvolvimento Local (Porta 3000)
+tags:
+  - name: auth
+    description: Autenticação JWT e sessão do usuário
+  - name: users
+    description: Cadastro e gerenciamento de usuários (ADMIN / FREELANCER)
+  - name: equipments
+    description: Inventário de equipamentos (com Cache-Aside no Redis)
+  - name: Productions
+    description: Gestão de produções, confirmação de reserva e publicação Pub/Sub
+  - name: Production Stages
+    description: Controle das etapas da produção (Captação, Edição, Backup, Upload)
+  - name: Equipment Movements
+    description: Retirada (checkout), devolução (checkin) e histórico de movimentações
+  - name: Productions Google Calendar
+    description: Integração OAuth2 e sincronização com Google Calendar (Circuit Breaker)
+  - name: damages
+    description: Registro de avarias com upload de fotos
+  - name: Contracts & Terms
+    description: Geração de termos de responsabilidade em PDF e assinatura digital
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  headers:
+    X-Cache:
+      description: Indica se a resposta veio do cache no Redis (HIT) ou do banco MySQL (MISS)
+      schema:
+        type: string
+        enum: [HIT, MISS]
+    X-Correlation-Id:
+      description: UUID da requisição para rastreamento nos logs
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [statusCode, error, message, timestamp, path, correlationId]
+      properties:
+        statusCode:
+          type: integer
+          example: 409
+        error:
+          type: string
+          example: ConflictException
+        message:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+          example: "Conflito de reserva: 1 equipamento(s) já alocado(s) em outra produção no período selecionado."
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-11-14T21:00:00.000Z"
+        path:
+          type: string
+          example: "/api/v1/productions/8a1f2c90-1234-4b56-9abc-def012345678/confirm"
+        correlationId:
+          type: string
+          format: uuid
+          example: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+    LoginDto:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          example: admin@casetrack.com
+        password:
+          type: string
+          example: admin123
+    CreateEquipmentDto:
+      type: object
+      required: [name, category, serialNumber]
+      properties:
+        name:
+          type: string
+          example: Sony FX6 Cinema Camera
+        category:
+          type: string
+          example: CAMERA
+        serialNumber:
+          type: string
+          example: SN-FX6-00981
+        status:
+          type: string
+          enum: [DISPONIVEL, EM_USO, MANUTENCAO]
+          default: DISPONIVEL
+        description:
+          type: string
+          example: Corpo Sony FX6 com alça XLR e 2 baterias
+    CreateProductionDto:
+      type: object
+      required: [title, scheduledAt, scheduledEndAt]
+      properties:
+        title:
+          type: string
+          example: Documentário Amazônia - Diária 01
+        description:
+          type: string
+          example: Captação externa com 2 câmeras
+        clientName:
+          type: string
+          example: Produtora Horizonte
+        scheduledAt:
+          type: string
+          format: date-time
+          example: "2026-11-20T08:00:00.000Z"
+        scheduledEndAt:
+          type: string
+          format: date-time
+          example: "2026-11-20T18:00:00.000Z"
+        equipmentIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        stages:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+                enum: [CAPTACAO, EDICAO, BACKUP, UPLOAD]
+              assignedUserId:
+                type: string
+                format: uuid
+    CheckoutEquipmentDto:
+      type: object
+      required: [condition]
+      properties:
+        condition:
+          type: string
+          enum: [OK, DAMAGED]
+          example: OK
+        damageId:
+          type: integer
+          nullable: true
+          description: Obrigatório quando condition=DAMAGED
+        notes:
+          type: string
+          example: Equipamento conferido na retirada.
+    CheckinEquipmentDto:
+      type: object
+      required: [condition]
+      properties:
+        condition:
+          type: string
+          enum: [OK, DAMAGED]
+          example: OK
+        damageId:
+          type: integer
+          nullable: true
+          description: Obrigatório quando condition=DAMAGED
+        notes:
+          type: string
+          example: Devolvido sem avarias.
+    SubstituteEquipmentDto:
+      type: object
+      required: [replacementEquipmentId]
+      properties:
+        replacementEquipmentId:
+          type: string
+          format: uuid
+        reason:
+          type: string
+          example: Substituição por defeito identificado na inspeção.
+    SignContractDto:
+      type: object
+      required: [signerName, signerDocument, acceptedTerms]
+      properties:
+        signerName:
+          type: string
+          example: Douglas Alexandre Marchesi
+        signerDocument:
+          type: string
+          example: "123.456.789-00"
+        acceptedTerms:
+          type: boolean
+          example: true
+paths:
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Autenticar usuário e gerar token JWT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginDto'
+      responses:
+        '200':
+          description: Login realizado com sucesso
+        '401':
+          description: Credenciais inválidas
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /auth/profile:
+    get:
+      tags: [auth]
+      summary: Retornar dados do usuário logado
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Perfil retornado com sucesso
+        '401':
+          description: Não autenticado
+  /users:
+    get:
+      tags: [users]
+      summary: Listar usuários (ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: skip
+          schema:
+            type: integer
+        - in: query
+          name: take
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Lista de usuários
+    post:
+      tags: [users]
+      summary: Criar usuário (ADMIN)
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Usuário criado
+  /equipments:
+    get:
+      tags: [equipments]
+      summary: Listar equipamentos (Cache-Aside TTL 60s)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: skip
+          schema:
+            type: integer
+        - in: query
+          name: take
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Lista de equipamentos
+          headers:
+            X-Cache:
+              $ref: '#/components/headers/X-Cache'
+    post:
+      tags: [equipments]
+      summary: Cadastrar equipamento e invalidar cache (ADMIN)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateEquipmentDto'
+      responses:
+        '201':
+          description: Equipamento cadastrado
+  /equipments/{id}:
+    get:
+      tags: [equipments]
+      summary: Buscar equipamento por ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Dados do equipamento
+        '404':
+          description: Equipamento não encontrado
+    patch:
+      tags: [equipments]
+      summary: Atualizar equipamento e invalidar cache (ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Equipamento atualizado
+    delete:
+      tags: [equipments]
+      summary: Remover equipamento e invalidar cache (ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Equipamento removido
+  /productions:
+    get:
+      tags: [Productions]
+      summary: Listar produções com filtros (Cache-Aside TTL 60s)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+        - in: query
+          name: search
+          schema:
+            type: string
+        - in: query
+          name: startDate
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: endDate
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Lista de produções
+          headers:
+            X-Cache:
+              $ref: '#/components/headers/X-Cache'
+    post:
+      tags: [Productions]
+      summary: Criar produção com etapas e equipamentos (ADMIN)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProductionDto'
+      responses:
+        '201':
+          description: Produção criada
+  /productions/my/pending:
+    get:
+      tags: [Productions]
+      summary: Listar pendências do usuário logado (etapas e devoluções)
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Pendências do usuário
+  /productions/{id}:
+    get:
+      tags: [Productions]
+      summary: Buscar detalhes de uma produção
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Detalhes da produção
+        '404':
+          description: Produção não encontrada
+    patch:
+      tags: [Productions]
+      summary: Atualizar dados da produção (ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Produção atualizada
+    delete:
+      tags: [Productions]
+      summary: Cancelar produção (ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Produção cancelada
+  /productions/{id}/confirm:
+    patch:
+      tags: [Productions]
+      summary: Confirmar produção validando conflitos de reserva e publicando evento no Redis (ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Produção confirmada e evento publicado no canal casetrack:events
+        '409':
+          description: Conflito de horário nos equipamentos alocados
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /productions/{id}/equipments/{peId}/substitute:
+    patch:
+      tags: [Productions]
+      summary: Substituir equipamento avariado na produção (ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: path
+          name: peId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubstituteEquipmentDto'
+      responses:
+        '200':
+          description: Equipamento substituído
+        '422':
+          description: Equipamento substituto indisponível
+  /productions/{id}/stages/{stageId}/start:
+    patch:
+      tags: [Production Stages]
+      summary: Iniciar etapa da produção
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: path
+          name: stageId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Etapa iniciada
+  /productions/{id}/stages/{stageId}/complete:
+    post:
+      tags: [Production Stages]
+      summary: Concluir etapa da produção
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: path
+          name: stageId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Etapa concluída
+        '422':
+          description: Equipamentos pendentes de retirada na captação
+  /productions/{id}/equipments/{peId}/checkout:
+    post:
+      tags: [Equipment Movements]
+      summary: Realizar checkout (retirada) do equipamento
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: path
+          name: peId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckoutEquipmentDto'
+      responses:
+        '200':
+          description: Checkout realizado
+  /productions/{id}/equipments/{peId}/checkin:
+    post:
+      tags: [Equipment Movements]
+      summary: Realizar checkin (devolução) do equipamento
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: path
+          name: peId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckinEquipmentDto'
+      responses:
+        '200':
+          description: Devolução registrada
+  /productions/{id}/equipments/{peId}/movements:
+    get:
+      tags: [Equipment Movements]
+      summary: Consultar histórico de movimentações do equipamento na produção
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: path
+          name: peId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Histórico de movimentações
+  /productions/{id}/sync-google:
+    post:
+      tags: [Productions Google Calendar]
+      summary: Sincronizar produção com o Google Calendar
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Sincronizado ou resposta de fallback do Circuit Breaker
+  /damages:
+    get:
+      tags: [damages]
+      summary: Listar registros de avarias
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Lista de avarias
+    post:
+      tags: [damages]
+      summary: Registrar avaria com upload de até 4 imagens
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                equipmentId:
+                  type: string
+                  format: uuid
+                description:
+                  type: string
+                severity:
+                  type: string
+                  enum: [LOW, MEDIUM, HIGH, CRITICAL]
+                files:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+      responses:
+        '201':
+          description: Avaria registrada
+  /contracts/production/{productionId}:
+    post:
+      tags: [Contracts & Terms]
+      summary: Gerar termo de responsabilidade em PDF para a produção (ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: productionId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '201':
+          description: PDF gerado com sucesso
+    get:
+      tags: [Contracts & Terms]
+      summary: Buscar contrato mais recente da produção
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: productionId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Dados do contrato
+  /contracts/{id}/sign:
+    post:
+      tags: [Contracts & Terms]
+      summary: Assinar digitalmente o termo de responsabilidade
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignContractDto'
+      responses:
+        '200':
+          description: Assinatura registrada
+  /contracts/{id}/download:
+    get:
+      tags: [Contracts & Terms]
+      summary: Baixar arquivo PDF do contrato
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Arquivo PDF
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
