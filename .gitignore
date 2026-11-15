@@ -149,24 +149,4 @@ dist/
 # Projeto
 doc/
 uploads/
-
-# Planejamento Interno, Rascunhos e Artefatos Locais
-_internal_planning/
-.antigravitycli/
-.gemini/
-.claude/
-.cursor/
-.agent/
-docs/designs/
-concepts_brief.md
-design_draft.md
-zoom_out_report.md
-comprehension_report.md
-critic_report.md
-intermediate_zoom_out_report.md
-implementation_readiness_report.md
-consolidated_review_report.md
-casetrack_rubrica_08_architecture.md
-SITEMAP.md
-CHECKLIST_RUBRICA_08.md
 *.pdf
